@@ -1,8 +1,8 @@
 
 #include "defaultTrace.h"
 
-#include "err.h"
 #include "allocators/dummyAllocator.h"
+#include "err.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +33,7 @@ err_t dummyRealloc(void **const ptr, const size_t count, const size_t size, [[ma
 	QUITE_CHECK(ptr != NULL);
 	QUITE_CHECK(*ptr != NULL);
 	QUITE_CHECK(count > 0 && size > 0);
-	
+
 	// "the dummy allocator don't support realloc"
 	QUITE_CHECK(false);
 

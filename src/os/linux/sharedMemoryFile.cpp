@@ -77,8 +77,8 @@ THROWS err_t setSharedMemoryFileSize(size_t size)
 
 	QUITE_CHECK(currentSize != nullptr);
 	QUITE_CHECK(IS_VALID_FD(memfd));
-	
-	//size is not huge pages allinged
+
+	// size is not huge pages allinged
 	QUITE_CHECK((size % (1 << 21)) == 0);
 
 	QUITE_CHECK(ftruncate(memfd.fd, size) == 0);

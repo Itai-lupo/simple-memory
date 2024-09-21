@@ -11,9 +11,9 @@ extern "C"
 	THROWS err_t initSharedMemory();
 	err_t closeSharedMemory();
 
-	THROWS err_t sharedAlloc(void **const data, const size_t count, const size_t size, allocatorFlags flags);
-	THROWS err_t sharedRealloc(void **const data, const size_t count, const size_t size, allocatorFlags flags);
-	THROWS err_t sharedDealloc(void **const data);
+	THROWS err_t sharedAlloc(void **const data, const size_t count, const size_t size, allocatorFlags flags, void *sharedAllocatorData);
+	THROWS err_t sharedRealloc(void **const data, const size_t count, const size_t size, allocatorFlags flags, void *sharedAllocatorData);
+	THROWS err_t sharedDealloc(void **const data,  void *sharedAllocatorData);
 
 	/*  void *malloc(size_t size);
 	 void free(void *_Nullable ptr);

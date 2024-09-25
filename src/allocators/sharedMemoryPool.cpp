@@ -13,42 +13,24 @@
 #include "allocators/dummyAllocator.h"
 #include "allocators/unsafeAllocator.h"
 
+#include "memoryUtils/allocatorsConsts.h"
+#include "memoryUtils/allocatorsUtilFunctions.h"
+
 #include <alloca.h>
 #include <math.h>
 #include <sched.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/param.h>
 
-// this 16GiB(2^34B) most system won't even by able to allocate that much ever so there will be errors out of memry most
-// likly before we reach that
-static constexpr const size_t MAX_RANGE_EXPONENT = 34;
-
-// min block size is 16MiB to save on mangment size, this is the allocater that give blocks to the local pools there
-// fore it dosn't need less then that
-static constexpr const size_t MIN_BUDDY_BLOCK_SIZE_EXPONENT = 15;
-
-static const off_t poolSize = sysconf(_SC_PAGESIZE) * 16;
 
 static const memoryAllocator allocator = {&sharedAlloc, &sharedRealloc, &sharedDealloc, NULL};
-
-const constexpr size_t freeListCount = GET_NEEDED_FREE_LISTS_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT);
-
-#define ALLOC_BUDDY_ON_STACK(list_size) (buddyAllocator *)alloca(sizeof(buddyAllocator) + list_size)
-
-static buddyAllocator *g_buddy = nullptr;
-
-#ifndef SLAB_ALLOCATION_CACHES_SIZES
-#define SLAB_ALLOCATION_CACHES_SIZES                                                                                   \
-	{                                                                                                                  \
-		32, 64, 128, 255, 510, 1020, 2040, 4080, 8180                                                                  \
-	}
-#endif
-
-const constexpr inline size_t allocationCachesSizes[] = SLAB_ALLOCATION_CACHES_SIZES;
 
 static memoryAllocator tempCaches[256][sizeof(allocationCachesSizes) / sizeof(size_t)] = {
 	{{NULL, NULL, NULL, NULL}}
 };
+
+
 /**
  * @brief in order to use the buddy allocator, we need a buddy allocator, so first we put it on the stack and then we
  * can copy it to somewhere else.
@@ -83,29 +65,7 @@ cleanup:
 	return err;
 }
 
-/**
- * @brief after we have a real shared allocator we want to move all of the buddy allocator data to it from the stack
- */
-THROWS static err_t moveBuddyFromStackToFinalAllocator(buddyAllocator **resBuddyAllocator, buddyAllocator *buddyOnStack)
-{
-	err_t err = NO_ERRORCODE;
-	QUITE_RETHROW(buddyAlloc(buddyOnStack, (void **)resBuddyAllocator,
-							 sizeof(buddyAllocator) +
-								 sizeof(darray *) *
-									 GET_NEEDED_FREE_LISTS_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT)));
 
-	memcpy(*resBuddyAllocator, buddyOnStack,
-		   sizeof(buddyAllocator) +
-			   sizeof(darray *) * GET_NEEDED_FREE_LISTS_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT));
-
-	for (size_t i = 0; i < GET_NEEDED_FREE_LISTS_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT); i++)
-	{
-		QUITE_RETHROW(darraySwitchAllocator(&((*resBuddyAllocator)->freeLists[i]), &allocator));
-	}
-
-cleanup:
-	return err;
-}
 
 /**
  * @brief we want each core to alloc from a memory that is garnted to be thread safe
@@ -151,7 +111,7 @@ THROWS err_t initSharedMemory()
 
 	QUITE_RETHROW(initCoreCaches(buddy));
 
-	QUITE_RETHROW(moveBuddyFromStackToFinalAllocator(&g_buddy, buddy));
+	QUITE_RETHROW(moveBuddyFromStackToFinalAllocator(&g_buddy, buddy, &allocator));
 
 cleanup:
 	return err;
@@ -169,34 +129,57 @@ cleanup:
 	return err;
 }
 
+
+THROWS static err_t handleSlabAlloc(void **const data, uint32_t sizeClass, allocatorFlags flags)
+{
+	err_t err = NO_ERRORCODE;
+	slab *tempSlab;
+	uint32_t coreId = 0;
+
+  getcpu(&coreId, NULL);
+	err = tempCaches[coreId][sizeClass].alloc(data, 1, allocationCachesSizes[sizeClass], flags, tempCaches[coreId][sizeClass].data);
+  if(err.errorCode == ENOMEM)
+  {
+    err = NO_ERRORCODE;
+
+    // if we the cache has no more memory we might be able to just add more memory to it and try agin.
+    // but we only need to check on the new memory we added.
+		QUITE_RETHROW(buddyAlloc(g_buddy, (void**)&tempSlab, SLAB_SIZE));
+    QUITE_RETHROW(appendSlab(&tempCaches[coreId][sizeClass], tempSlab));
+	  QUITE_RETHROW(tempCaches[coreId][sizeClass].alloc(data, 1,  allocationCachesSizes[sizeClass], flags, (void*)tempSlab));
+  } 
+  else
+  {
+    QUITE_RETHROW(err);
+  }
+
+cleanup:
+  return err;
+}
+
 THROWS err_t sharedAlloc(void **const data, const size_t count, const size_t size, allocatorFlags flags, [[maybe_unused]] void *sharedAllocatorData)
 {
 	err_t err = NO_ERRORCODE;
-	uint32_t coreId = 0;
 	uint32_t sizeClass = UINT32_MAX;
 
 	QUITE_CHECK(data != NULL);
 	QUITE_CHECK(*data == NULL);
 	QUITE_CHECK(size > 0);
-
-	getcpu(&coreId, NULL);
   
-  for(size_t i = 0; i < sizeof(allocationCachesSizes) / sizeof(size_t); i++)
+  sizeClass = getSizeClass(size * count);
+
+  if(sizeClass == UINT32_MAX)
   {
-    if(count * size < allocationCachesSizes[i])
-    {
-      sizeClass = i;
-      break;
-    }
+    QUITE_RETHROW(buddyAlloc(g_buddy, data, count * size));
+  } 
+  else
+  {
+    QUITE_RETHROW(handleSlabAlloc(data, sizeClass, flags));
   }
-
-  QUITE_CHECK(sizeClass != UINT32_MAX)
-
-	QUITE_RETHROW(tempCaches[coreId][sizeClass].alloc(data, count, size, flags, tempCaches[coreId][sizeClass].data));
 
 	if ((flags | ALLOCATOR_CLEAR_MEMORY) == 1)
 	{
-		memset(*data, 0, count * size);
+		bzero(*data, count * size);
 	}
 
 cleanup:
@@ -206,32 +189,63 @@ cleanup:
 THROWS err_t sharedRealloc(void **const data, const size_t count, const size_t size, allocatorFlags flags, [[maybe_unused]] void *sharedAllocatorData)
 {
 	err_t err = NO_ERRORCODE;
-	uint32_t coreId = 0;
-
-	QUITE_CHECK(data != NULL);
+  slab *s = NULL;
+  void *temp = NULL;
+	
+  QUITE_CHECK(data != NULL);
 	QUITE_CHECK(*data != NULL);
 	QUITE_CHECK(size > 0);
 
-	getcpu(&coreId, NULL);
+  temp = *data;
+  s = GET_SLAB_START(*data);
 
+  if(s->header.slabMagic == SLAB_MAGIC)
+  {
+    err = tempCaches[0][0].realloc(data, count, size, flags, s);
+    if(err.errorCode == ENOMEM)
+    {
+      err = NO_ERRORCODE;
+      QUITE_RETHROW(sharedAlloc(data, count, size, flags, sharedAllocatorData));
+      memcpy(*data, temp, MIN(size * count, s->header.cellSize));
+      QUITE_RETHROW(tempCaches[0][0].free(&temp, s));
+    }
+    else
+    {
+      QUITE_RETHROW(err);
+    }
+  }
+  else
+  {
+    QUITE_RETHROW(buddyFree(g_buddy, data));
+    QUITE_RETHROW(buddyAlloc(g_buddy, data, count * size));
+  }
 
-	if (flags || ALLOCATOR_CLEAR_MEMORY == 1)
-	{
-		memset(*data, 0, count * size);
-	}
-
+  
 cleanup:
 	return err;
 }
 
+
+
 THROWS err_t sharedDealloc(void **const data, [[maybe_unused]] void *sharedAllocatorData)
 {
 	err_t err = NO_ERRORCODE;
-
-	QUITE_CHECK(data != NULL);
+  slab *s= NULL;
+	
+  QUITE_CHECK(data != NULL);
 	QUITE_CHECK(*data != NULL);
+  
+  s = GET_SLAB_START(*data);
 
-
+  if(s->header.slabMagic == SLAB_MAGIC)
+  {
+    QUITE_RETHROW(tempCaches[0][0].free(data, s));
+  }
+  else
+  {
+    QUITE_RETHROW(buddyFree(g_buddy, data));
+  }
+  
 cleanup:
 	if (data != NULL)
 	{

@@ -12,6 +12,7 @@
 #define SLAB_MAGIC 0xABABABABABABABAB
 #endif
 
+
 struct slab;
 
 typedef struct
@@ -21,10 +22,12 @@ typedef struct
 	size_t cellSize;
 } slabHead;
 
+static const constexpr size_t SLAB_CACHE_SIZE = (SLAB_SIZE - sizeof(slabHead));
+
 typedef struct slab
 {
 	slabHead header;
-	uint8_t cache[SLAB_SIZE - sizeof(slabHead)];
+	uint8_t cache[SLAB_CACHE_SIZE];
 } slab;
 
 #ifdef __cplusplus

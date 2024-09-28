@@ -15,7 +15,7 @@ static constexpr size_t GET_SLAB_FREE_LIST_SIZE(size_t cellSize)
 
 static constexpr size_t GET_SLAB_CELL_INDEX(size_t cellSize, off_t i) 
 {
-  return (GET_SLAB_FREE_LIST_SIZE(cellSize) + (i) * cellSize);
+  return (GET_SLAB_FREE_LIST_SIZE(cellSize) + 1 + (i) * cellSize);
 }
 
 static constexpr size_t IS_CELL_IN_SLAB(size_t cellSize, off_t i) 
@@ -62,6 +62,7 @@ THROWS static err_t unsafeAlloc(void **const ptr, const size_t count, const size
   slab *slabContent = (slab*)firstSlab;
   slab *currentSlab = slabContent;
   int freeIndex = -1;
+  size_t freeListSize = 0;
 
 	QUITE_CHECK(ptr != NULL)
 	QUITE_CHECK(count > 0 && size > 0);
@@ -69,24 +70,27 @@ THROWS static err_t unsafeAlloc(void **const ptr, const size_t count, const size
 	QUITE_CHECK(firstSlab != NULL);
   QUITE_CHECK(slabContent->header.slabMagic == SLAB_MAGIC);
   QUITE_CHECK(slabContent->header.cellSize >= size * count);
+  
+  freeListSize = GET_SLAB_FREE_LIST_SIZE(slabContent->header.cellSize);
 
   do
   {
-    freeIndex = findFirstZeroInByteArray(currentSlab->cache,  GET_SLAB_FREE_LIST_SIZE(currentSlab->header.cellSize));
+    freeIndex = findFirstZeroInByteArray(currentSlab->cache,  freeListSize);
     if(freeIndex != -1 && IS_CELL_IN_SLAB(currentSlab->header.cellSize, freeIndex + 1))
     {
-          *ptr  = (void*)(currentSlab->cache + GET_SLAB_CELL_INDEX(currentSlab->header.cellSize, freeIndex));
-          currentSlab->cache[freeIndex / 8] |=  (1 << (freeIndex % 8));
+          *ptr  = (void*)&currentSlab->cache[GET_SLAB_CELL_INDEX(currentSlab->header.cellSize, freeIndex)];
+          currentSlab->cache[freeIndex / 8]  |=  (1 << (freeIndex % 8));
+
           CHECK_TRACE(
-              (size_t)*ptr + (count * size) <= (size_t)currentSlab + SLAB_SIZE, 
+              (size_t)*ptr + (count * size) < (size_t)currentSlab + SLAB_SIZE, 
               "resulted ptr is outside of the slab range, ptr end at {} which is after {}", 
               (void*)((size_t)*ptr + (count * size)), (void*)((size_t)currentSlab + SLAB_SIZE));
     }
-
-    currentSlab = currentSlab->header.nextSlab;
-  } while(currentSlab != NULL && *ptr == NULL);
+  } while( *ptr == NULL && (currentSlab = currentSlab->header.nextSlab) != NULL);
 
   CHECK_NOTRACE_ERRORCODE(*ptr != NULL, ENOMEM);
+  QUITE_CHECK((size_t)*ptr + slabContent->header.cellSize < (size_t)currentSlab + SLAB_SIZE);
+  QUITE_CHECK((size_t)*ptr > (size_t)&currentSlab->cache[freeListSize]);
 
 cleanup:
 	return err;
@@ -124,13 +128,15 @@ THROWS err_t unsafeDealloc(void **const ptr, void *data)
 	QUITE_CHECK(s != NULL);
 
   QUITE_CHECK(s->header.slabMagic == SLAB_MAGIC);
-  QUITE_CHECK(s->header.cellSize >= 0);
+  QUITE_CHECK(s->header.cellSize > 0);
   
-  cellOffset = ((size_t)*ptr - (size_t)(s->cache + GET_SLAB_FREE_LIST_SIZE(s->header.cellSize)));
+  cellOffset = ((size_t)*ptr - (size_t)(s->cache + GET_SLAB_FREE_LIST_SIZE(s->header.cellSize) + 1));
 
-  QUITE_CHECK( cellOffset % s->header.cellSize == 0 && cellOffset <= SLAB_CACHE_SIZE);
+  QUITE_CHECK(cellOffset % s->header.cellSize == 0);
+  QUITE_CHECK(cellOffset <= SLAB_CACHE_SIZE)
   cellIndex = cellOffset / s->header.cellSize;
 
+  QUITE_CHECK((s->cache[cellIndex / 8] | (1 << (cellIndex % 8))) > 0 );
   s->cache[cellIndex / 8] &=  ~(1 << (cellIndex % 8));
 	
   *ptr = NULL;
@@ -181,7 +187,7 @@ err_t appendSlab(memoryAllocator *unsafeAllocator, slab *newSlab)
   firstSlab = (slab*)unsafeAllocator->data;
 
 	QUITE_CHECK(firstSlab != NULL);
-
+  
 	newSlab->header.nextSlab = nullptr;
   newSlab->header.slabMagic = SLAB_MAGIC;
 	newSlab->header.cellSize = firstSlab->header.cellSize;
@@ -193,8 +199,10 @@ err_t appendSlab(memoryAllocator *unsafeAllocator, slab *newSlab)
     newSlab->cache[i] = 0;
   }
 
-  for(currentSlab = firstSlab; currentSlab->header.nextSlab != NULL; currentSlab = currentSlab->header.nextSlab){}
-  
+  for(currentSlab = firstSlab; currentSlab->header.nextSlab != NULL; currentSlab = currentSlab->header.nextSlab)
+  {
+    QUITE_CHECK(currentSlab != newSlab);
+  }
   currentSlab->header.nextSlab = newSlab;
 
 cleanup:

@@ -24,7 +24,9 @@
 #include <sys/param.h>
 
 
-static const memoryAllocator allocator = {&sharedAlloc, &sharedRealloc, &sharedDealloc, NULL};
+static const size_t freeListSize = GET_BUDDY_MAX_ELEMENT_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT);
+
+//static const memoryAllocator allocator = {&sharedAlloc, &sharedRealloc, &sharedDealloc, NULL};
 
 static memoryAllocator tempCaches[256][sizeof(allocationCachesSizes) / sizeof(size_t)] = {
 	{{NULL, NULL, NULL, NULL}}
@@ -38,34 +40,22 @@ static memoryAllocator tempCaches[256][sizeof(allocationCachesSizes) / sizeof(si
  * @note we can't put this on that function stack as it will be freed at the end of the function so we get it from the
  * caller.
  */
-THROWS static err_t initBuddyAllocatorOnStack(buddyAllocator *resBuddyAllocator,
-											  void *buddyFreeListsData[freeListCount][100],
-											  darray buddyFreeLists[freeListCount])
+THROWS static err_t initBuddyAllocatorOnStack(buddyAllocator *resBuddyAllocator)
 {
 	err_t err = NO_ERRORCODE;
 
 	resBuddyAllocator->memorySource = {nullptr, getSharedMemoryFileSize, setSharedMemoryFileSize};
 	resBuddyAllocator->poolSizeExponent = MAX_RANGE_EXPONENT;
 	resBuddyAllocator->smallestAllocationSizeExponent = MIN_BUDDY_BLOCK_SIZE_EXPONENT;
-	resBuddyAllocator->freeListsCount = freeListCount;
+	resBuddyAllocator->freeListSize =   (pow(2, MAX_RANGE_EXPONENT - MIN_BUDDY_BLOCK_SIZE_EXPONENT))
+;
 
 	QUITE_RETHROW(getSharedMemoryFileStartAddr(&resBuddyAllocator->memorySource.startAddr));
-
-	for (size_t i = 0; i < freeListCount; i++)
-	{
-		buddyFreeLists[i].data = buddyFreeListsData[i];
-		resBuddyAllocator->freeLists[i] = buddyFreeLists + i;
-
-		QUITE_RETHROW(darrayCreate(100, sizeof(void *), getDummyAllocator(), resBuddyAllocator->freeLists + i));
-	}
-
 	QUITE_RETHROW(initBuddyAllocator(resBuddyAllocator));
 
 cleanup:
 	return err;
 }
-
-
 
 /**
  * @brief we want each core to alloc from a memory that is garnted to be thread safe
@@ -99,19 +89,17 @@ THROWS err_t initSharedMemory()
 {
 	err_t err = NO_ERRORCODE;
 
-	buddyAllocator *buddy = (buddyAllocator *)alloca(sizeof(buddyAllocator) + sizeof(buddyAllocator) * freeListCount);
-	darray buddyFreeLists[freeListCount];
-	void *buddyFreeListsData[freeListCount][100] = {{nullptr}};
+	buddyAllocator *buddy = (buddyAllocator *)alloca(sizeof(buddyAllocator) + freeListSize/8);
 
 	CHECK(g_buddy == nullptr);
 
 	QUITE_RETHROW(initSharedMemoryFile(pow(2, MAX_RANGE_EXPONENT)));
 
-	QUITE_RETHROW(initBuddyAllocatorOnStack(buddy, buddyFreeListsData, buddyFreeLists));
+	QUITE_RETHROW(initBuddyAllocatorOnStack(buddy));
 
 	QUITE_RETHROW(initCoreCaches(buddy));
-
-	QUITE_RETHROW(moveBuddyFromStackToFinalAllocator(&g_buddy, buddy, &allocator));
+   
+	QUITE_RETHROW(moveBuddyFromStackToFinalAllocator(&g_buddy, buddy));
 
 cleanup:
 	return err;
@@ -137,16 +125,15 @@ THROWS static err_t handleSlabAlloc(void **const data, uint32_t sizeClass, alloc
 	uint32_t coreId = 0;
 
   getcpu(&coreId, NULL);
-	err = tempCaches[coreId][sizeClass].alloc(data, 1, allocationCachesSizes[sizeClass], flags, tempCaches[coreId][sizeClass].data);
+	err = tempCaches[coreId][sizeClass].alloc(data, 1, allocationCachesSizes[sizeClass] , flags, tempCaches[coreId][sizeClass].data);
   if(err.errorCode == ENOMEM)
   {
     err = NO_ERRORCODE;
-
     // if we the cache has no more memory we might be able to just add more memory to it and try agin.
     // but we only need to check on the new memory we added.
 		QUITE_RETHROW(buddyAlloc(g_buddy, (void**)&tempSlab, SLAB_SIZE));
     QUITE_RETHROW(appendSlab(&tempCaches[coreId][sizeClass], tempSlab));
-	  QUITE_RETHROW(tempCaches[coreId][sizeClass].alloc(data, 1,  allocationCachesSizes[sizeClass], flags, (void*)tempSlab));
+	  QUITE_RETHROW(tempCaches[coreId][sizeClass].alloc(data, 1,  allocationCachesSizes[sizeClass] , flags, (void*)tempSlab));
   } 
   else
   {
@@ -234,8 +221,8 @@ THROWS err_t sharedDealloc(void **const data, [[maybe_unused]] void *sharedAlloc
 	
   QUITE_CHECK(data != NULL);
 	QUITE_CHECK(*data != NULL);
-  
-  s = GET_SLAB_START(*data);
+
+  QUITE_RETHROW(buddyGetCellStartAddrFromAddrInCell(g_buddy, *data, (void**)&s));
 
   if(s->header.slabMagic == SLAB_MAGIC)
   {
@@ -243,6 +230,7 @@ THROWS err_t sharedDealloc(void **const data, [[maybe_unused]] void *sharedAlloc
   }
   else
   {
+    QUITE_CHECK( s == *data);
     QUITE_RETHROW(buddyFree(g_buddy, data));
   }
   

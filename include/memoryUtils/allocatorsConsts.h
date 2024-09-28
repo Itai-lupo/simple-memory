@@ -15,7 +15,6 @@ static constexpr const size_t MIN_BUDDY_BLOCK_SIZE_EXPONENT = 15;
 static const off_t poolSize = sysconf(_SC_PAGESIZE) * 16;
 
 
-const constexpr size_t freeListCount = GET_NEEDED_FREE_LISTS_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT);
 
 #define ALLOC_BUDDY_ON_STACK(list_size) (buddyAllocator *)alloca(sizeof(buddyAllocator) + list_size)
 

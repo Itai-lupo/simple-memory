@@ -26,22 +26,14 @@ static constexpr uint32_t getSizeClass(const size_t size)
 /**
  * @brief after we have a real shared allocator we want to move all of the buddy allocator data to it from the stack
  */
-THROWS static err_t moveBuddyFromStackToFinalAllocator(buddyAllocator **resBuddyAllocator, buddyAllocator *buddyOnStack, const memoryAllocator *allocator)
+THROWS static err_t moveBuddyFromStackToFinalAllocator(buddyAllocator **resBuddyAllocator, buddyAllocator *buddyOnStack)
 {
 	err_t err = NO_ERRORCODE;
-	QUITE_RETHROW(buddyAlloc(buddyOnStack, (void **)resBuddyAllocator,
-							 sizeof(buddyAllocator) +
-								 sizeof(darray *) *
-									 GET_NEEDED_FREE_LISTS_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT)));
+  QUITE_RETHROW(buddyAlloc(buddyOnStack,(void**)resBuddyAllocator,
+                sizeof(buddyAllocator) + GET_BUDDY_MAX_ELEMENT_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT) / 8));
 
 	memcpy(*resBuddyAllocator, buddyOnStack,
-		   sizeof(buddyAllocator) +
-			   sizeof(darray *) * GET_NEEDED_FREE_LISTS_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT));
-
-	for (size_t i = 0; i < GET_NEEDED_FREE_LISTS_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT); i++)
-	{
-		QUITE_RETHROW(darraySwitchAllocator(&((*resBuddyAllocator)->freeLists[i]), allocator));
-	}
+		   sizeof(buddyAllocator) + GET_BUDDY_MAX_ELEMENT_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT) / 8);
 
 cleanup:
 	return err;

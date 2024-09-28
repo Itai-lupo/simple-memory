@@ -15,7 +15,7 @@
 
 struct slab;
 
-typedef struct
+typedef struct __attribute__((__packed__))
 {
 	uint64_t slabMagic;
 	slab *nextSlab;
@@ -24,7 +24,7 @@ typedef struct
 
 static const constexpr size_t SLAB_CACHE_SIZE = (SLAB_SIZE - sizeof(slabHead));
 
-typedef struct slab
+typedef struct __attribute__((__packed__)) slab
 {
 	slabHead header;
 	uint8_t cache[SLAB_CACHE_SIZE];

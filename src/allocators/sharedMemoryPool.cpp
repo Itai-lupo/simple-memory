@@ -91,7 +91,7 @@ THROWS err_t initSharedMemory()
 
 	buddyAllocator *buddy = (buddyAllocator *)alloca(sizeof(buddyAllocator) + freeListSize/8);
 
-	CHECK(g_buddy == nullptr);
+	QUITE_CHECK(g_buddy == nullptr);
 
 	QUITE_RETHROW(initSharedMemoryFile(pow(2, MAX_RANGE_EXPONENT)));
 
@@ -117,28 +117,44 @@ cleanup:
 	return err;
 }
 
+THROWS static err_t handleSlabAllocError(err_t allocErr, memoryAllocator *slabAllocator, void **const data,  size_t size, allocatorFlags flags)
+{
+  err_t err = NO_ERRORCODE;
+	slab *tempSlab;
+
+  if(allocErr.errorCode == ENOMEM)
+  {
+    // if we the cache has no more memory we might be able to just add more memory to it and try agin.
+    // but we only need to check on the new memory we added.
+		QUITE_RETHROW(buddyAlloc(g_buddy, (void**)&tempSlab, SLAB_SIZE));
+    QUITE_RETHROW(appendSlab(slabAllocator, tempSlab));
+	  QUITE_RETHROW(slabAllocator->alloc(data, 1,  size , flags, (void*)tempSlab));
+  } 
+  else
+  {
+    QUITE_RETHROW(allocErr);
+  }
+
+
+cleanup:
+  return err;
+}
 
 THROWS static err_t handleSlabAlloc(void **const data, uint32_t sizeClass, allocatorFlags flags)
 {
 	err_t err = NO_ERRORCODE;
-	slab *tempSlab;
 	uint32_t coreId = 0;
-
+  size_t size = 0;
+  memoryAllocator *slabAllocator = NULL;
+  
   getcpu(&coreId, NULL);
-	err = tempCaches[coreId][sizeClass].alloc(data, 1, allocationCachesSizes[sizeClass] , flags, tempCaches[coreId][sizeClass].data);
-  if(err.errorCode == ENOMEM)
-  {
-    err = NO_ERRORCODE;
-    // if we the cache has no more memory we might be able to just add more memory to it and try agin.
-    // but we only need to check on the new memory we added.
-		QUITE_RETHROW(buddyAlloc(g_buddy, (void**)&tempSlab, SLAB_SIZE));
-    QUITE_RETHROW(appendSlab(&tempCaches[coreId][sizeClass], tempSlab));
-	  QUITE_RETHROW(tempCaches[coreId][sizeClass].alloc(data, 1,  allocationCachesSizes[sizeClass] , flags, (void*)tempSlab));
-  } 
-  else
-  {
-    QUITE_RETHROW(err);
-  }
+  slabAllocator = &tempCaches[coreId][sizeClass];
+  size =  allocationCachesSizes[sizeClass];
+	
+  RETHROW_BASE_NOTRACE(
+      slabAllocator->alloc(data, 1, allocationCachesSizes[sizeClass] , flags, slabAllocator->data), 
+      err = NO_ERRORCODE;
+      QUITE_RETHROW(handleSlabAllocError(err, slabAllocator, data, size, flags)));
 
 cleanup:
   return err;

@@ -57,28 +57,22 @@ err_t seq()
   volatile int i = 0;
   struct rseq_cs cs = {0, 0, 0, 0, 0};
   volatile int restarts = 0;
-  uint32_t *sig_ip =  (uint32_t*)((__u64)&&restart - 4);
 
 
   cs.start_ip = (__u64)&&start;
   cs.post_commit_offset = (__u64)&&cleanup -  (__u64)&&start ;
   cs.abort_ip = (__u64)&&restart;
 
-  CHECK(mprotect((void*)((size_t)sig_ip & ~(sysconf(_SC_PAGESIZE) -1)),  sysconf(_SC_PAGESIZE) , PROT_READ | PROT_WRITE | PROT_EXEC) == 0);
-  *((__u64*)cs.abort_ip - 1) = RSEQ_SIG; 
-  
   r.rseq_cs = (__u64)&cs;
 
 
   LOG_INFO("{:X}", *((__u64*)cs.abort_ip - 1));
 
   LOG_INFO("{:X} {} {:X} {} ", cs.start_ip, cs.post_commit_offset, cs.abort_ip, (void*)r.rseq_cs);
-  if(i == 0){ 
-  goto *(void*)(cs.start_ip);
-  }
-  i += 1;
-  i += 1;
-  i += 1;
+
+
+  // this put RSEQ_SIG at the end of the asm instraction on most archs, and will be forcd to be before the ABORT_HANDLER
+  i = RSEQ_SIG;
 
 restart:
   restarts += 1;

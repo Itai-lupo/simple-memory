@@ -82,17 +82,15 @@ err_t seq()
 
 restart:
   restarts += 1;
+  r.rseq_cs = (__u64)&cs;
 
 start:
-  for(volatile size_t j = 0; j < 1000000000; j += 1)
+  for(volatile size_t j = 0; restarts < 10; j += 1)
   {
     i += 1;
   }
 
 cleanup:
-  i += 1;
-  i += 1;
-  i += 1;
 
   LOG_INFO("{} {}", (int)i, (int)restarts);
   r.rseq_cs = 0;

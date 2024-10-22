@@ -9,6 +9,7 @@
 #include <threads.h>
 
 #include <ucontext.h>
+#define RSEQ_SIG 0	
 
 static  volatile thread_local struct rseq r  __attribute__(( aligned(1024))) = {
   .cpu_id_start = 0,
@@ -59,12 +60,9 @@ volatile size_t static i = 0;
 
 void tryToCall(void);
 
-__attribute__((section("rseq")))
-__attribute__((optnone)) err_t seq([[maybe_unused]] void *data)
+USED_IN_RSEQ err_t seq([[maybe_unused]] void *data)
 {
   err_t err = NO_ERRORCODE;
-
-//  RSEQ_ABORT_SECTION_START(restart, start);
 
 
   for(size_t j = 0; j < 50000000; j += 1)
@@ -76,8 +74,8 @@ __attribute__((optnone)) err_t seq([[maybe_unused]] void *data)
 }
 
 
-__attribute__((section("rseq")))
-__attribute__((optnone, noinline)) void tryToCall(void)
+USED_IN_RSEQ
+__attribute__((noinline)) void tryToCall(void)
 {
   for(size_t j = 0; j < 50000000; j += 1)
   {
@@ -87,8 +85,6 @@ __attribute__((optnone, noinline)) void tryToCall(void)
 }
 
 
-typedef err_t (*rseqCallback)(void *data);
-typedef err_t (*rseqAbortHandlerCallback)(bool *shouldRetry, void *data);
 
 typedef struct 
 {
@@ -187,7 +183,6 @@ start:
     QUITE_CHECK(swapcontext(&mainContext, &rseqContext) != -1);
     
     QUITE_RETHROW(rseqData.err);
-
     if(rseqData.shouldRetry)
     {
       rseqData.maxRetrys--;
@@ -198,7 +193,6 @@ start:
     }
   } while(rseqData.shouldRetry && rseqData.maxRetrys > 0);
 
-  LOG_INFO("{} {}", (size_t)i, 1000 - rseqData.maxRetrys);
 
   QUITE_CHECK(rseqData.maxRetrys != 0);
 

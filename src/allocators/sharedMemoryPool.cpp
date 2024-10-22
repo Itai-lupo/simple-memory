@@ -10,11 +10,12 @@
 #include "types/memoryAllocator.h"
 #include "types/memoryMapInfo.h"
 
-#include "allocators/dummyAllocator.h"
 #include "allocators/unsafeAllocator.h"
 
 #include "memoryUtils/allocatorsConsts.h"
 #include "memoryUtils/allocatorsUtilFunctions.h"
+
+#include "os/rseq.h"
 
 #include <alloca.h>
 #include <math.h>
@@ -24,14 +25,25 @@
 #include <sys/param.h>
 
 
+#include <sys/ipc.h>
+#include <sys/sem.h>
+
+union semun {
+    int val;
+    struct semid_ds *buf;
+    ushort *array;
+};
+
 static const size_t freeListSize = GET_BUDDY_MAX_ELEMENT_COUNT(MAX_RANGE_EXPONENT, MIN_BUDDY_BLOCK_SIZE_EXPONENT);
 
 //static const memoryAllocator allocator = {&sharedAlloc, &sharedRealloc, &sharedDealloc, NULL};
-
 static memoryAllocator tempCaches[256][sizeof(allocationCachesSizes) / sizeof(size_t)] = {
 	{{NULL, NULL, NULL, NULL}}
 };
 
+int semid = 0;
+
+pid_t *isCoreInUse = NULL;
 
 /**
  * @brief in order to use the buddy allocator, we need a buddy allocator, so first we put it on the stack and then we
@@ -43,19 +55,37 @@ static memoryAllocator tempCaches[256][sizeof(allocationCachesSizes) / sizeof(si
 THROWS static err_t initBuddyAllocatorOnStack(buddyAllocator *resBuddyAllocator)
 {
 	err_t err = NO_ERRORCODE;
+  union semun arg;
+  struct sembuf sb;
 
 	resBuddyAllocator->memorySource = {nullptr, getSharedMemoryFileSize, setSharedMemoryFileSize};
 	resBuddyAllocator->poolSizeExponent = MAX_RANGE_EXPONENT;
 	resBuddyAllocator->smallestAllocationSizeExponent = MIN_BUDDY_BLOCK_SIZE_EXPONENT;
-	resBuddyAllocator->freeListSize =   (pow(2, MAX_RANGE_EXPONENT - MIN_BUDDY_BLOCK_SIZE_EXPONENT))
-;
+	resBuddyAllocator->freeListSize =   (pow(2, MAX_RANGE_EXPONENT - MIN_BUDDY_BLOCK_SIZE_EXPONENT));
 
 	QUITE_RETHROW(getSharedMemoryFileStartAddr(&resBuddyAllocator->memorySource.startAddr));
 	QUITE_RETHROW(initBuddyAllocator(resBuddyAllocator));
 
+  semid = semget(0, 1, IPC_CREAT | IPC_EXCL | 0666);
+
+  sb.sem_op = 1;
+  sb.sem_flg = 0;
+  arg.val = 1;
+
+  for(sb.sem_num = 0; sb.sem_num < 1; sb.sem_num++) { 
+    /* do a semop() to "free" the semaphores. */
+    /* this sets the sem_otime field, as needed below. */
+    if (semop(semid, &sb, 1) == -1) {
+      int e = errno;
+      semctl(semid, 0, IPC_RMID); /* clean up */
+      QUITE_CHECK(e == 0);
+    }
+  }
+
 cleanup:
 	return err;
 }
+
 
 /**
  * @brief we want each core to alloc from a memory that is garnted to be thread safe
@@ -68,6 +98,7 @@ THROWS err_t initCoreCaches(buddyAllocator *buddyOnStack)
 	long coreCount = sysconf(_SC_NPROCESSORS_ONLN);
 	uint32_t coreId = 0;
 	slab *tempSlab;
+
 	QUITE_CHECK(buddyOnStack != nullptr);
 
 	getcpu(&coreId, NULL);
@@ -100,6 +131,8 @@ THROWS err_t initSharedMemory()
 	QUITE_RETHROW(initCoreCaches(buddy));
    
 	QUITE_RETHROW(moveBuddyFromStackToFinalAllocator(&g_buddy, buddy));
+	
+  QUITE_RETHROW(buddyAlloc(g_buddy, (void**)&isCoreInUse, sizeof(pid_t) * 128));
 
 cleanup:
 	return err;
@@ -114,49 +147,103 @@ err_t closeSharedMemory()
 
 cleanup:
 	REWARN(closeSharedMemoryFile());
+
 	return err;
 }
 
-THROWS static err_t handleSlabAllocError(err_t allocErr, memoryAllocator *slabAllocator, void **const data,  size_t size, allocatorFlags flags)
+
+THROWS static err_t handleSlabAllocError(memoryAllocator *slabAllocator, [[maybe_unused]] void **const data, [[maybe_unused]]  size_t size, [[maybe_unused]] allocatorFlags flags)
 {
   err_t err = NO_ERRORCODE;
 	slab *tempSlab;
+    
+  struct sembuf sb; 
+  sb.sem_num = 0;
+  sb.sem_op = -1;  /* set to allocate resource */
+  sb.sem_flg = SEM_UNDO;
+  
 
-  if(allocErr.errorCode == ENOMEM)
-  {
-    // if we the cache has no more memory we might be able to just add more memory to it and try agin.
-    // but we only need to check on the new memory we added.
-		QUITE_RETHROW(buddyAlloc(g_buddy, (void**)&tempSlab, SLAB_SIZE));
-    QUITE_RETHROW(appendSlab(slabAllocator, tempSlab));
-	  QUITE_RETHROW(slabAllocator->alloc(data, 1,  size , flags, (void*)tempSlab));
-  } 
-  else
-  {
-    QUITE_RETHROW(allocErr);
-  }
+  QUITE_CHECK(semop(semid, &sb, 1) == 0);
 
+  // if we the cache has no more memory we might be able to just add more memory to it and try agin.
+  // but we only need to check on the new memory we added.
+  QUITE_RETHROW(buddyAlloc(g_buddy, (void**)&tempSlab, SLAB_SIZE));
+
+  QUITE_RETHROW(appendSlab(slabAllocator, tempSlab));
+
+	QUITE_RETHROW(slabAllocator->alloc(data, 1,  size , flags, (void*)tempSlab));
+
+cleanup:
+  sb.sem_op = 1;
+  WARN(semop(semid, &sb, 1) == 0);
+
+  return err;
+}
+
+typedef struct 
+{
+  void **const data;
+  uint32_t sizeClass;
+  allocatorFlags flags;
+  uint32_t coreId;
+} rseqAllocCall;
+
+USED_IN_RSEQ err_t allocRseq(void *rseqAllocData)
+{
+  err_t err = NO_ERRORCODE;
+  rseqAllocCall *rseqCall = (rseqAllocCall*)rseqAllocData;
+
+  size_t size = 0;
+  memoryAllocator *slabAllocator = NULL;
+
+  QUITE_RETHROW(getCpuId(&rseqCall->coreId));
+
+
+  slabAllocator = &tempCaches[rseqCall->coreId][rseqCall->sizeClass];
+  size =  allocationCachesSizes[rseqCall->sizeClass];
+  QUITE_RETHROW(slabAllocator->alloc(rseqCall->data, 1, size, rseqCall->flags, slabAllocator->data));
 
 cleanup:
   return err;
 }
 
-THROWS static err_t handleSlabAlloc(void **const data, uint32_t sizeClass, allocatorFlags flags)
+err_t abortRseqAlloc( [[maybe_unused]] bool *shouldRetry, void *rseqAllocData)
 {
-	err_t err = NO_ERRORCODE;
-	uint32_t coreId = 0;
-  size_t size = 0;
-  memoryAllocator *slabAllocator = NULL;
+
+  err_t err = NO_ERRORCODE;
+  rseqAllocCall *rseqCall = (rseqAllocCall*)rseqAllocData;
   
-  getcpu(&coreId, NULL);
-  slabAllocator = &tempCaches[coreId][sizeClass];
-  size =  allocationCachesSizes[sizeClass];
-	
-  RETHROW_BASE_NOTRACE(
-      slabAllocator->alloc(data, 1, allocationCachesSizes[sizeClass] , flags, slabAllocator->data), 
-      err = NO_ERRORCODE;
-      QUITE_RETHROW(handleSlabAllocError(err, slabAllocator, data, size, flags)));
+  if(*rseqCall->data != NULL)
+  {
+    QUITE_RETHROW(sharedDealloc(rseqCall->data, NULL));
+  }
 
 cleanup:
+  return err;
+}
+
+THROWS static err_t handleSlabAlloc(void **const data, uint32_t sizeClass, [[maybe_unused]] allocatorFlags flags)
+{
+	err_t err = NO_ERRORCODE;
+  rseqAllocCall rseqCall = {data, sizeClass, flags, UINT32_MAX};
+  struct sembuf sb; 
+  sb.sem_num = 0;
+  sb.sem_op = -1;  /* set to allocate resource */
+  sb.sem_flg = SEM_UNDO;
+  
+
+ QUITE_RETHROW(doRseq(10000, &allocRseq, &abortRseqAlloc, (void*)&rseqCall));
+
+cleanup:
+  sb.sem_op = 1;
+
+
+  if(err.errorCode == ENOMEM)
+  {
+    err = NO_ERRORCODE;
+    err = handleSlabAllocError(&tempCaches[rseqCall.coreId][sizeClass], data, allocationCachesSizes[rseqCall.sizeClass], flags);
+  }
+
   return err;
 }
 
@@ -164,13 +251,19 @@ THROWS err_t sharedAlloc(void **const data, const size_t count, const size_t siz
 {
 	err_t err = NO_ERRORCODE;
 	uint32_t sizeClass = UINT32_MAX;
+ 
+  struct sembuf sb; 
+  sb.sem_num = 0;
+  sb.sem_op = -1;  /* set to allocate resource */
+  sb.sem_flg = SEM_UNDO;
+  
 
-	QUITE_CHECK(data != NULL);
+  QUITE_CHECK(data != NULL);
 	QUITE_CHECK(*data == NULL);
 	QUITE_CHECK(size > 0);
   
   sizeClass = getSizeClass(size * count);
-
+  
   if(sizeClass == UINT32_MAX)
   {
     QUITE_RETHROW(buddyAlloc(g_buddy, data, count * size));
@@ -180,12 +273,15 @@ THROWS err_t sharedAlloc(void **const data, const size_t count, const size_t siz
     QUITE_RETHROW(handleSlabAlloc(data, sizeClass, flags));
   }
 
+  QUITE_CHECK(*data != NULL);
 	if ((flags | ALLOCATOR_CLEAR_MEMORY) == 1)
 	{
 		bzero(*data, count * size);
 	}
 
-cleanup:
+cleanup:  
+  sb.sem_op = 1;
+
 	return err;
 }
 

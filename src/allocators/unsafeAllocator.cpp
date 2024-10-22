@@ -6,23 +6,35 @@
 
 #include "err.h"
 
-#include <math.h>
+#include "os/rseq.h"
 
-static constexpr size_t GET_SLAB_FREE_LIST_SIZE(size_t cellSize) 
-{
-  return ((size_t)ceil((float)((SLAB_SIZE - sizeof(slabHead)) / cellSize) / 8.0f));
+
+USED_IN_RSEQ
+static constexpr long ceil2 (double x) {
+    if ((long)x > LONG_MAX) return (long)x; // big floats are all ints
+    return ((long)(x+(0.99999999999999997)));
 }
 
+
+USED_IN_RSEQ
+static constexpr size_t GET_SLAB_FREE_LIST_SIZE(size_t cellSize) 
+{
+  return ((size_t)ceil2((float)((SLAB_SIZE - sizeof(slabHead)) / cellSize) / 8.0f));
+}
+
+USED_IN_RSEQ
 static constexpr size_t GET_SLAB_CELL_INDEX(size_t cellSize, off_t i) 
 {
   return (GET_SLAB_FREE_LIST_SIZE(cellSize) + 1 + (i) * cellSize);
 }
 
+USED_IN_RSEQ
 static constexpr size_t IS_CELL_IN_SLAB(size_t cellSize, off_t i) 
 {
   return (GET_SLAB_CELL_INDEX(cellSize, i) <= SLAB_CACHE_SIZE);
 }
 
+USED_IN_RSEQ
 static constexpr int8_t findFirstZeroInByte(uint8_t byte)
 {
   for(int8_t i = 0; i < 8; i++)
@@ -35,6 +47,7 @@ static constexpr int8_t findFirstZeroInByte(uint8_t byte)
   return -1;
 }
 
+USED_IN_RSEQ
 static constexpr int findFirstZeroInByteArray(uint8_t *byteArray, size_t byteArraySize)
 {
     int8_t emptyBitIndex = -1;
@@ -55,7 +68,7 @@ static constexpr int findFirstZeroInByteArray(uint8_t *byteArray, size_t byteArr
     return -1;
 }
 
-THROWS static err_t unsafeAlloc(void **const ptr, const size_t count, const size_t size,
+USED_IN_RSEQ THROWS static err_t unsafeAlloc(void **const ptr, const size_t count, const size_t size,
 							   [[maybe_unused]] allocatorFlags flags, void *firstSlab)
 {
 	err_t err = NO_ERRORCODE;
@@ -63,6 +76,7 @@ THROWS static err_t unsafeAlloc(void **const ptr, const size_t count, const size
   slab *currentSlab = slabContent;
   int freeIndex = -1;
   size_t freeListSize = 0;
+  int i = 0;
 
 	QUITE_CHECK(ptr != NULL)
 	QUITE_CHECK(count > 0 && size > 0);
@@ -70,27 +84,29 @@ THROWS static err_t unsafeAlloc(void **const ptr, const size_t count, const size
 	QUITE_CHECK(firstSlab != NULL);
   QUITE_CHECK(slabContent->header.slabMagic == SLAB_MAGIC);
   QUITE_CHECK(slabContent->header.cellSize >= size * count);
-  
   freeListSize = GET_SLAB_FREE_LIST_SIZE(slabContent->header.cellSize);
 
   do
   {
+    QUITE_CHECK(i < 10000);
     freeIndex = findFirstZeroInByteArray(currentSlab->cache,  freeListSize);
     if(freeIndex != -1 && IS_CELL_IN_SLAB(currentSlab->header.cellSize, freeIndex + 1))
     {
-          *ptr  = (void*)&currentSlab->cache[GET_SLAB_CELL_INDEX(currentSlab->header.cellSize, freeIndex)];
-          currentSlab->cache[freeIndex / 8]  |=  (1 << (freeIndex % 8));
+      QUITE_CHECK( (currentSlab->cache[freeIndex / 8]  &  (1 << (freeIndex % 8))) == 0);
+      currentSlab->cache[freeIndex / 8]  |=  (1 << (freeIndex % 8));
+      
+      QUITE_CHECK( (currentSlab->cache[freeIndex / 8]  &  (1 << (freeIndex % 8))) != 0);
+      *ptr  = (void*)&currentSlab->cache[GET_SLAB_CELL_INDEX(currentSlab->header.cellSize, freeIndex)];
 
-          CHECK_TRACE(
-              (size_t)*ptr + (count * size) < (size_t)currentSlab + SLAB_SIZE, 
-              "resulted ptr is outside of the slab range, ptr end at {} which is after {}", 
-              (void*)((size_t)*ptr + (count * size)), (void*)((size_t)currentSlab + SLAB_SIZE));
+      QUITE_CHECK((size_t)*ptr + slabContent->header.cellSize < (size_t)currentSlab + SLAB_SIZE);
     }
+    i+=1;
   } while( *ptr == NULL && (currentSlab = currentSlab->header.nextSlab) != NULL);
 
   CHECK_NOTRACE_ERRORCODE(*ptr != NULL, ENOMEM);
   QUITE_CHECK((size_t)*ptr + slabContent->header.cellSize < (size_t)currentSlab + SLAB_SIZE);
   QUITE_CHECK((size_t)*ptr > (size_t)&currentSlab->cache[freeListSize]);
+  
 
 cleanup:
 	return err;
@@ -187,13 +203,12 @@ err_t appendSlab(memoryAllocator *unsafeAllocator, slab *newSlab)
   firstSlab = (slab*)unsafeAllocator->data;
 
 	QUITE_CHECK(firstSlab != NULL);
-  
+
 	newSlab->header.nextSlab = nullptr;
   newSlab->header.slabMagic = SLAB_MAGIC;
 	newSlab->header.cellSize = firstSlab->header.cellSize;
 
   freeListSize = GET_SLAB_FREE_LIST_SIZE(firstSlab->header.cellSize);
-
   for(size_t i = 0; i < freeListSize; i++)
   {
     newSlab->cache[i] = 0;

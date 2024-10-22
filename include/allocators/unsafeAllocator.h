@@ -35,6 +35,7 @@ extern "C"
 {
 #endif
 
+
 	/**
 	 * @brief create a allocator that can be called from a resq or a critical section
 	 * @see man resq(2)

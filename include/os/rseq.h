@@ -20,7 +20,6 @@ extern "C"
   THROWS err_t rseqInit();
   THROWS err_t doRseq(size_t maxRetrys, rseqCallback rseqFunc, rseqAbortHandlerCallback abortHandler, void *data);
 
-  THROWS err_t rseqMain(); 
 
   THROWS err_t getCpuId(uint32_t *cpuId);
 

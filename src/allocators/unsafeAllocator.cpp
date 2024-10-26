@@ -1,17 +1,16 @@
 #include "allocators/unsafeAllocator.h"
 
-//#include "defaultTrace.h"
-
-#include "log.h"
+#include "os/rseq.h"
+#include "defaultTrace.h"
 
 #include "err.h"
 
-#include "os/rseq.h"
-
+#include <stdint.h>
+#include <stdatomic.h>
 
 USED_IN_RSEQ
 static constexpr long ceil2 (double x) {
-    if ((long)x > LONG_MAX) return (long)x; // big floats are all ints
+    if ((int64_t)x > INT64_MAX) return (int64_t)x; // big floats are all ints
     return ((long)(x+(0.99999999999999997)));
 }
 
@@ -88,14 +87,11 @@ USED_IN_RSEQ THROWS static err_t unsafeAlloc(void **const ptr, const size_t coun
 
   do
   {
-    QUITE_CHECK(i < 10000);
+    QUITE_CHECK(i < 1000000);
     freeIndex = findFirstZeroInByteArray(currentSlab->cache,  freeListSize);
     if(freeIndex != -1 && IS_CELL_IN_SLAB(currentSlab->header.cellSize, freeIndex + 1))
     {
-      QUITE_CHECK( (currentSlab->cache[freeIndex / 8]  &  (1 << (freeIndex % 8))) == 0);
       currentSlab->cache[freeIndex / 8]  |=  (1 << (freeIndex % 8));
-      
-      QUITE_CHECK( (currentSlab->cache[freeIndex / 8]  &  (1 << (freeIndex % 8))) != 0);
       *ptr  = (void*)&currentSlab->cache[GET_SLAB_CELL_INDEX(currentSlab->header.cellSize, freeIndex)];
 
       QUITE_CHECK((size_t)*ptr + slabContent->header.cellSize < (size_t)currentSlab + SLAB_SIZE);
@@ -189,13 +185,14 @@ cleanup:
 	return err;
 }
 
+
 err_t appendSlab(memoryAllocator *unsafeAllocator, slab *newSlab)
 {
 	err_t err = NO_ERRORCODE;
 	
   size_t freeListSize = 0;
   slab *firstSlab = NULL;
-  slab *currentSlab = NULL;
+
   
   QUITE_CHECK(unsafeAllocator != NULL);
 	QUITE_CHECK(newSlab != NULL);
@@ -214,11 +211,10 @@ err_t appendSlab(memoryAllocator *unsafeAllocator, slab *newSlab)
     newSlab->cache[i] = 0;
   }
 
-  for(currentSlab = firstSlab; currentSlab->header.nextSlab != NULL; currentSlab = currentSlab->header.nextSlab)
-  {
-    QUITE_CHECK(currentSlab != newSlab);
-  }
-  currentSlab->header.nextSlab = newSlab;
+  
+  do {
+    newSlab->header.nextSlab  = (slab*)unsafeAllocator->data;
+  } while (!atomic_compare_exchange_weak(( void* _Atomic *)&unsafeAllocator->data, (void**)&firstSlab, newSlab));
 
 cleanup:
 	return err;

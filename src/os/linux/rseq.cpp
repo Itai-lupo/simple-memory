@@ -1,15 +1,18 @@
 #include "os/rseq.h"
 
-#include "log.h"
+#include "defaultTrace.h"
 
 #include "err.h"
 
+#include <cstddef>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <linux/rseq.h>
 #include <syscall.h>
 #include <threads.h>
 
 #include <ucontext.h>
+#include <unistd.h>
 #define RSEQ_SIG 0
 
 static volatile thread_local struct rseq r __attribute__((aligned(1024))) = {.cpu_id_start = 0,
@@ -44,7 +47,6 @@ THROWS err_t rseqInit()
 	libc_rseq_flags_p = (uint32_t *)dlsym(RTLD_NEXT, "__rseq_flags");
 	if (libc_rseq_size_p && libc_rseq_offset_p && libc_rseq_flags_p && *libc_rseq_size_p != 0)
 	{
-		LOG_INFO("glibc has the rseq");
 	}
 
 	RETHROW(sysRseq(&r, sizeof(struct rseq), 0, RSEQ_SIG));
@@ -102,9 +104,12 @@ THROWS err_t doRseq(size_t maxRetrys, rseqCallback rseqFunc, rseqAbortHandlerCal
 	rseqCall rseqData = {rseqFunc, true, maxRetrys, data, NO_ERRORCODE};
 
 	static const rseq_cs cs = {0, 0, (uint64_t)&__start_rseq, (uint64_t)&__stop_rseq - (uint64_t)&__start_rseq,
-							   (uint64_t) && restart};
+							   (uint64_t)&&restart};
 
-	QUITE_CHECK(r.cpu_id != (__u32)RSEQ_CPU_ID_UNINITIALIZED);
+	unlikelyIf(r.cpu_id == (__u32)RSEQ_CPU_ID_UNINITIALIZED)
+	{
+		QUITE_RETHROW(rseqInit());
+	}
 
 	QUITE_CHECK(maxRetrys > 0);
 	QUITE_CHECK(rseqFunc != NULL);

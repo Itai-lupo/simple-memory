@@ -8,6 +8,7 @@
 extern "C"
 {
 #endif
+
 	THROWS err_t initSharedMemory();
 	err_t closeSharedMemory();
 
@@ -15,13 +16,15 @@ extern "C"
 	THROWS err_t sharedRealloc(void **const data, const size_t count, const size_t size, allocatorFlags flags, void *sharedAllocatorData);
 	THROWS err_t sharedDealloc(void **const data,  void *sharedAllocatorData);
 
-	/*  void *malloc(size_t size);
-	 void free(void *_Nullable ptr);
-	 void *calloc(size_t nmemb, size_t size);
-	 void *realloc(void *_Nullable ptr, size_t size);
-	 void *reallocarray(void *_Nullable ptr, size_t nmemb, size_t size);
+	/**
+	 * @brief get the shared Allocator.
+	 * this in a way is singleton as it will always will return the same shared allocator
+	 *
+	 * @return memoryAllocator*
+	 */
+	memoryAllocator *getSharedAllocator();
 
-  */
+  
 
 #ifdef __cplusplus
 }

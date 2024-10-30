@@ -19,6 +19,7 @@ typedef struct {
 	uint64_t slabMagic;
 	slab *nextSlab;
 	size_t cellSize;
+	bool isSlabFull;
 } slabHead;
 
 static const constexpr size_t SLAB_CACHE_SIZE = (SLAB_SIZE - sizeof(slabHead));

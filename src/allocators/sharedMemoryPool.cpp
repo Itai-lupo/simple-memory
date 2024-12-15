@@ -212,6 +212,7 @@ USED_IN_RSEQ err_t allocRseq(void *rseqAllocData)
 
 	size_t size = 0;
 	memoryAllocator *slabAllocator = NULL;
+	isInRseq  = true;
 
 	QUITE_RETHROW(getCpuId(&rseqCall->coreId));
 
@@ -231,10 +232,9 @@ err_t abortRseqAlloc([[maybe_unused]] bool *shouldRetry, void *rseqAllocData)
 
 	if (*rseqCall->data != NULL)
 	{
-		QUITE_RETHROW(sharedDealloc(rseqCall->data, NULL));
+		*shouldRetry = false;
 	}
 
-cleanup:
 	return err;
 }
 
@@ -368,5 +368,5 @@ cleanup:
 
 memoryAllocator *getSharedAllocator()
 {
-	return &sharedAllocator;
+	return (memoryAllocator*)&sharedAllocator;
 }

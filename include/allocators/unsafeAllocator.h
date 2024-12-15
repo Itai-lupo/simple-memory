@@ -12,6 +12,7 @@
 #define SLAB_MAGIC 0xABABABABABABABAB
 #endif
 
+extern bool isInRseq;
 
 struct slab;
 

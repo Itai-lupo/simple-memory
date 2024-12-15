@@ -18,6 +18,7 @@
 
 #define USED_IN_RSEQ __attribute__((section("rseq")))
 
+extern volatile thread_local struct rseq r ;
 
 typedef err_t (*rseqCallback)(void *data);
 typedef err_t (*rseqAbortHandlerCallback)(bool *shouldRetry, void *data);

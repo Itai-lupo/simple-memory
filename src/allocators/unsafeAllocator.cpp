@@ -1,17 +1,17 @@
 #include "allocators/unsafeAllocator.h"
 
 #include "defaultTrace.h"
-#include "defines/checkApi.h"
 #include "os/rseq.h"
 
 #include "err.h"
 
+#include <cstdint>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <strings.h>
 
 USED_IN_RSEQ
-static constexpr long ceil2(double x)
+static long ceil2(double x)
 {
 	if ((int64_t)x > INT64_MAX)
 		return (int64_t)x; // big floats are all ints
@@ -19,25 +19,25 @@ static constexpr long ceil2(double x)
 }
 
 USED_IN_RSEQ
-static constexpr size_t GET_SLAB_FREE_LIST_SIZE(size_t cellSize)
+static size_t GET_SLAB_FREE_LIST_SIZE(size_t cellSize)
 {
 	return ((size_t)ceil2((float)((SLAB_SIZE - sizeof(slabHead)) / cellSize) / 8.0f));
 }
 
 USED_IN_RSEQ
-static constexpr size_t GET_SLAB_CELL_INDEX(size_t cellSize, off_t i)
+static size_t GET_SLAB_CELL_INDEX(size_t cellSize, off_t i)
 {
 	return (GET_SLAB_FREE_LIST_SIZE(cellSize) + 1 + (i)*cellSize);
 }
 
 USED_IN_RSEQ
-static constexpr size_t IS_CELL_IN_SLAB(size_t cellSize, off_t i)
+static size_t IS_CELL_IN_SLAB(size_t cellSize, off_t i)
 {
 	return (GET_SLAB_CELL_INDEX(cellSize, i) <= SLAB_CACHE_SIZE);
 }
 
 USED_IN_RSEQ
-static constexpr int8_t findFirstZeroInByte(uint8_t byte)
+static int8_t findFirstZeroInByte(uint8_t byte)
 {
 	for (int8_t i = 0; i < 8; i++)
 	{
@@ -50,7 +50,7 @@ static constexpr int8_t findFirstZeroInByte(uint8_t byte)
 }
 
 USED_IN_RSEQ
-static constexpr int findFirstZeroInByteArray(uint8_t *byteArray, size_t byteArraySize)
+static int findFirstZeroInByteArray(uint8_t *byteArray, size_t byteArraySize)
 {
 	int8_t emptyBitIndex = -1;
 
@@ -70,6 +70,8 @@ static constexpr int findFirstZeroInByteArray(uint8_t *byteArray, size_t byteArr
 	return -1;
 }
 
+bool isInRseq = false;
+
 USED_IN_RSEQ THROWS static err_t unsafeAlloc(void **const ptr, const size_t count, const size_t size,
 											 [[maybe_unused]] allocatorFlags flags, void *firstSlab)
 {
@@ -80,26 +82,33 @@ USED_IN_RSEQ THROWS static err_t unsafeAlloc(void **const ptr, const size_t coun
 	size_t freeListSize = 0;
 	int i = 0;
 
-	QUITE_CHECK(ptr != NULL)
-	QUITE_CHECK(count > 0 && size > 0);
-	QUITE_CHECK(*ptr == NULL);
-	QUITE_CHECK(firstSlab != NULL);
-	QUITE_CHECK(slabContent->header.slabMagic == SLAB_MAGIC);
-	QUITE_CHECK(slabContent->header.cellSize >= size * count);
+	CHECK_NOTRACE_ERRORCODE(ptr != NULL, 0)
+	CHECK_NOTRACE_ERRORCODE(count > 0 && size > 0, 0);
+	CHECK_NOTRACE_ERRORCODE(*ptr == NULL, 0);
+	CHECK_NOTRACE_ERRORCODE(firstSlab != NULL, 0);
+	CHECK_NOTRACE_ERRORCODE(slabContent->header.slabMagic == SLAB_MAGIC, 0);
+	CHECK_NOTRACE_ERRORCODE(slabContent->header.cellSize >= size * count, 0);
 	freeListSize = GET_SLAB_FREE_LIST_SIZE(slabContent->header.cellSize);
+
+	if(r.rseq_cs != 0)
+	{	
+		((rseq_cs*)r.rseq_cs)->post_commit_offset = (uint64_t)&&post_commit_offset - ((rseq_cs*)r.rseq_cs)->start_ip;
+	}
 
 	do
 	{
-		QUITE_CHECK(i < 1000000);
+		CHECK_NOTRACE_ERRORCODE(i < 1000000, 0);
 		if (currentSlab->header.isSlabFull == false)
 		{
 			freeIndex = findFirstZeroInByteArray(currentSlab->cache, freeListSize);
 			if (freeIndex != -1 && IS_CELL_IN_SLAB(currentSlab->header.cellSize, freeIndex + 1))
 			{
-				currentSlab->cache[freeIndex / 8] |= (1 << (freeIndex % 8));
+	//todo: this might be a bug(|= is not atomic opration, free can change this value)
+				// currentSlab->cache[freeIndex / 8] |= (1 << (freeIndex % 8));
+				atomic_fetch_or((_Atomic uint8_t *)&currentSlab->cache[freeIndex / 8], (1 << (freeIndex % 8)));
+post_commit_offset:
 				*ptr = (void *)&currentSlab->cache[GET_SLAB_CELL_INDEX(currentSlab->header.cellSize, freeIndex)];
 
-				QUITE_CHECK((size_t)*ptr + slabContent->header.cellSize < (size_t)currentSlab + SLAB_SIZE);
 			}
 			else
 			{
@@ -110,8 +119,8 @@ USED_IN_RSEQ THROWS static err_t unsafeAlloc(void **const ptr, const size_t coun
 	} while (*ptr == NULL && (currentSlab = currentSlab->header.nextSlab) != NULL);
 
 	CHECK_NOTRACE_ERRORCODE(*ptr != NULL, ENOMEM);
-	QUITE_CHECK((size_t)*ptr + slabContent->header.cellSize < (size_t)currentSlab + SLAB_SIZE);
-	QUITE_CHECK((size_t)*ptr > (size_t)&currentSlab->cache[freeListSize]);
+	CHECK_NOTRACE_ERRORCODE((size_t)*ptr + slabContent->header.cellSize < (size_t)currentSlab + SLAB_SIZE, 0);
+	CHECK_NOTRACE_ERRORCODE((size_t)*ptr > (size_t)&currentSlab->cache[freeListSize], 0);
 
 cleanup:
 	return err;
@@ -161,7 +170,8 @@ THROWS err_t unsafeDealloc(void **const ptr, void *data)
 	QUITE_CHECK(&s->cache[GET_SLAB_CELL_INDEX(s->header.cellSize, cellIndex)] == *ptr);
 	QUITE_CHECK((s->cache[cellIndex] | (1 << (cellIndex % 8))) > 0);
 
-	s->cache[cellIndex / 8] &= ~(1 << (cellIndex % 8));
+	//todo: this might be a bug(&= is not atomic opration)
+	atomic_fetch_and((_Atomic uint8_t *)&s->cache[cellIndex / 8], ~(1 << (cellIndex % 8)));
 	s->header.isSlabFull = false;
 
 	*ptr = NULL;

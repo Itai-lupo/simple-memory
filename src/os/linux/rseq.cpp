@@ -2,8 +2,10 @@
 
 #include "defaultTrace.h"
 
+#include "defines/checkApi.h"
 #include "err.h"
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -13,9 +15,25 @@
 
 #include <ucontext.h>
 #include <unistd.h>
+#include <setjmp.h>
 #define RSEQ_SIG 0
 
-static volatile thread_local struct rseq r __attribute__((aligned(1024))) = {.cpu_id_start = 0,
+/* Allocate a large area for the TLS. */
+#define RSEQ_THREAD_AREA_ALLOC_SIZE	1024
+
+typedef struct
+{
+	rseqCallback rseq;
+
+	bool shouldRetry;
+	size_t maxRetrys;
+	void *data;
+	err_t err;
+} rseqCall;
+
+thread_local jmp_buf rseqJumpBuffer;
+
+volatile thread_local struct rseq r  = {.cpu_id_start = 0,
 																			 .cpu_id = (__u32)RSEQ_CPU_ID_UNINITIALIZED,
 																			 .rseq_cs = 0,
 																			 .flags = 0,
@@ -23,6 +41,9 @@ static volatile thread_local struct rseq r __attribute__((aligned(1024))) = {.cp
 																			 .mm_cid = 0
 
 };
+
+extern void *__start_rseq;
+extern void *__stop_rseq;
 
 THROWS static err_t sysRseq(volatile struct rseq *rseq_abi, uint32_t rseq_len, int flags, uint32_t sig)
 {
@@ -55,55 +76,46 @@ cleanup:
 	return err;
 }
 
-extern void *__start_rseq;
-extern void *__stop_rseq;
 
-typedef struct
-{
-	rseqCallback rseq;
-
-	bool shouldRetry;
-	size_t maxRetrys;
-	void *data;
-	err_t err;
-} rseqCall;
-
-__attribute__((section("rseq"))) void handleRseq(const rseq_cs *cs, rseqCall *rseqData)
+// we use optnone becose the compiler might reorder some stuff the can break stuff 
+USED_IN_RSEQ
+__attribute__((optnone))
+void handleRseq(const rseq_cs *cs, rseqCall *rseqData)
 {
 
 	err_t err = NO_ERRORCODE;
 
-	volatile uint32_t cpuId = r.cpu_id;
+	// volatile uint32_t cpuId = r.cpu_id;
 
-	QUITE_CHECK(cs != NULL);
-	QUITE_CHECK(rseqData != NULL);
+	CHECK_NOTRACE_ERRORCODE(cs != NULL, EINVAL);
+	CHECK_NOTRACE_ERRORCODE(rseqData != NULL, EINVAL);
 
 	r.rseq_cs = (uint64_t)cs;
+	QUITE_CHECK(r.cpu_id_start == r.cpu_id);
 
-	cpuId = r.cpu_id;
+	// cpuId = r.cpu_id_start;
+
 	QUITE_RETHROW(rseqData->rseq(rseqData->data));
 
-	QUITE_CHECK(r.rseq_cs != 0);
-	QUITE_CHECK(r.cpu_id == cpuId);
+	// CHECK_NOTRACE_ERRORCODE(r.rseq_cs != 0, 0);
+	// CHECK_NOTRACE_ERRORCODE(r.cpu_id_start == r.cpu_id, 0);
+	// CHECK_NOTRACE_ERRORCODE(r.cpu_id == cpuId, 0);
 
 cleanup:
 	r.rseq_cs = 0;
-
 	rseqData->shouldRetry = false;
 	rseqData->err = err;
 }
+
 
 THROWS err_t doRseq(size_t maxRetrys, rseqCallback rseqFunc, rseqAbortHandlerCallback abortHandler, void *data)
 {
 	err_t err = NO_ERRORCODE;
 
-	char rseqStack[16384];
-	static ucontext_t mainContext, rseqContext;
-
 	volatile bool static alwaystrue = true;
 	rseqCall rseqData = {rseqFunc, true, maxRetrys, data, NO_ERRORCODE};
 
-	static const rseq_cs cs = {0, 0, (uint64_t)&__start_rseq, (uint64_t)&__stop_rseq - (uint64_t)&__start_rseq,
+	const rseq_cs cs = {0, 0, (uint64_t)&__start_rseq, (uint64_t)&__stop_rseq - (uint64_t)&__start_rseq,
 							   (uint64_t)&&restart};
 
 	unlikelyIf(r.cpu_id == (__u32)RSEQ_CPU_ID_UNINITIALIZED)
@@ -118,7 +130,7 @@ THROWS err_t doRseq(size_t maxRetrys, rseqCallback rseqFunc, rseqAbortHandlerCal
 	QUITE_CHECK(
 		!((uint64_t)abortHandler >= (uint64_t)&__start_rseq && (uint64_t)abortHandler <= (uint64_t)&__stop_rseq));
 
-	if (alwaystrue)
+	if (alwaystrue)  [[likely]]
 	{
 		goto start;
 	}
@@ -126,36 +138,26 @@ THROWS err_t doRseq(size_t maxRetrys, rseqCallback rseqFunc, rseqAbortHandlerCal
 
 restart:
 
-	// the abort handler will be called from the rseq context
-	// we want to go back to the main context instad of trying to work on the rseq context.
+	// the abort handler will be called with invalid stack
+	// we want to go back to the main context instad of trying to work with invalid stack.
 	// remainder to get here the rseq context do "long jump" from within a function to outside of a function
 	// this mean we can't call return from here.
-	WARN(swapcontext(&rseqContext, &mainContext) != -1);
+	longjmp(rseqJumpBuffer, 0);
 
 	// if we get here we can't get back to the main context and we can't return so rip.
 	exit(errno);
 
 start:
-	do
+
+	// we want all the rseq function to be on there own section
+	// that allow as to call other functions that are in that section
+	// but that means the rseq abort handler need to be on other function
+	// that will mean we can't return from the abort handler(the return addr will be wrong)
+	// so we can use setjmp to save a valid stack outside of the rseq and go back to it.
+	while(!setjmp(rseqJumpBuffer) && rseqData.shouldRetry && rseqData.maxRetrys > 0)
 	{
 		rseqData.shouldRetry = true;
-
-		getcontext(&rseqContext);
-		rseqContext.uc_stack.ss_sp = rseqStack;
-		rseqContext.uc_stack.ss_size = sizeof(rseqStack);
-		rseqContext.uc_link = &mainContext;
-
-		errno = 0;
-		makecontext(&rseqContext, (void (*)())handleRseq, 2, &cs, &rseqData);
-		QUITE_CHECK(errno == 0);
-
-		// we want all the rseq function to be on there own section
-		// that allow as to call other functions that are in that section
-		// but that means the rseq abort handler need to be on other function
-		// that will mean we can return from the abort handler(the return addr will be wrong)
-		// so we can use context to snapshot a valid stack outside of the rseq and go back to it.
-		QUITE_CHECK(swapcontext(&mainContext, &rseqContext) != -1);
-
+		handleRseq(&cs, &rseqData);
 		QUITE_RETHROW(rseqData.err);
 		if (rseqData.shouldRetry)
 		{
@@ -165,22 +167,23 @@ start:
 				QUITE_RETHROW(abortHandler(&rseqData.shouldRetry, rseqData.data));
 			}
 		}
-	} while (rseqData.shouldRetry && rseqData.maxRetrys > 0);
+	}
+
 
 	QUITE_CHECK(rseqData.maxRetrys != 0);
-
 cleanup:
+
 	return err;
 }
 
 __attribute__((section("rseq"))) THROWS err_t getCpuId(uint32_t *cpuId)
 {
 	err_t err = NO_ERRORCODE;
-	QUITE_CHECK(cpuId != NULL);
-	QUITE_CHECK(r.cpu_id != (uint32_t)RSEQ_CPU_ID_UNINITIALIZED);
-	QUITE_CHECK(r.cpu_id != (uint32_t)RSEQ_CPU_ID_REGISTRATION_FAILED);
+	CHECK_NOTRACE_ERRORCODE(cpuId != NULL, EINVAL);
+	CHECK_NOTRACE_ERRORCODE(r.cpu_id != (uint32_t)RSEQ_CPU_ID_UNINITIALIZED, EINVAL);
+	CHECK_NOTRACE_ERRORCODE(r.cpu_id != (uint32_t)RSEQ_CPU_ID_REGISTRATION_FAILED, EINVAL);
 
-	*cpuId = r.cpu_id;
+	*cpuId = r.cpu_id_start;
 
 cleanup:
 	return err;
